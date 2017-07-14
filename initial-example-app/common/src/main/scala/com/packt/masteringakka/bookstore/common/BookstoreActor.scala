@@ -1,7 +1,9 @@
 package com.packt.masteringakka.bookstore.common
 
-import akka.actor._
+//import akka.actor._
+import akka.actor.{Actor, ActorLogging}
 import com.packt.masteringakka.bookstore._
+
 import scala.concurrent.Future
 
 /**
@@ -29,6 +31,6 @@ trait BookStoreActor extends Actor with ActorLogging{
         case f:Failure => f
         case other => FullResult(other)
       }.
-      recover(toFailure). 
+      recover(toFailure).
       pipeTo(sender())
 }

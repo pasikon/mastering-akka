@@ -41,7 +41,7 @@ class CreditCardTransactionHandler extends BookStoreActor{
   
   def receive = {
     case ChargeCreditCard(info, amount) => 
-      val result = 
+      val result: Future[CreditCardTransaction] =
         for{
           chargeResp <- chargeCard(info, amount)
           txn = CreditCardTransaction(0, info, amount, CreditTransactionStatus.Approved, Some(chargeResp.confirmationCode), new Date, new Date)
