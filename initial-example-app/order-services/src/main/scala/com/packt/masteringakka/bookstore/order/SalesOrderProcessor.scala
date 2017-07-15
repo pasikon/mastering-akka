@@ -1,16 +1,19 @@
 package com.packt.masteringakka.bookstore.order
 
-import java.util.Date
+import java.util.{Date, NoSuchElementException}
 
 import akka.actor.FSM.Failure
-import akka.actor.{ActorIdentity, ActorRef, FSM, Identify}
+import akka.actor.{ActorIdentity, ActorRef, FSM, Identify, Props, Status}
 import com.packt.masteringakka.bookstore.common._
 import com.packt.masteringakka.bookstore.domain.book.{Book, FindBook}
 import com.packt.masteringakka.bookstore.domain.credit.{ChargeCreditCard, CreditCardTransaction, CreditTransactionStatus}
 import com.packt.masteringakka.bookstore.domain.user.{BookstoreUser, FindUserById}
+import com.packt.masteringakka.bookstore.order.SalesOrderManagerDao.InventoryNotAvailaleException
 import com.packt.masteringakka.bookstore.order.SalesOrderProcessor.{InvalidBookIdError, InvalidUserIdError}
+import slick.dbio.DBIOAction
 
 import concurrent.duration._
+import scala.concurrent.{ExecutionContext, Future}
 import scala.language.postfixOps
 
 /**
@@ -20,7 +23,10 @@ class SalesOrderProcessor extends FSM[SalesOrderProcessor.State, SalesOrderProce
 
   import SalesOrderProcessor._
 
-  def unexpectedFail = Failure(FailureType.Service, ServiceResult.UnexpectedFailure )
+  implicit val ec: ExecutionContext = ExecutionContext.global
+  val dao = new SalesOrderProcessorDao
+
+  def unexpectedFail = Failure(FailureType.Service, ServiceResult.UnexpectedFailure)
 
   //  val dao = new SalesOrderPr
 
@@ -43,7 +49,7 @@ class SalesOrderProcessor extends FSM[SalesOrderProcessor.State, SalesOrderProce
             stateData.copy(bookMgr = actor)
           case ResolutionIdent.User =>
             stateData.copy(userMgr = actor)
-          case ResolutionIdent.Book =>
+          case ResolutionIdent.Credit =>
             stateData.copy(creditHandler = actor)
         }
         stay using newData
@@ -61,7 +67,7 @@ class SalesOrderProcessor extends FSM[SalesOrderProcessor.State, SalesOrderProce
   }
 
   when(LookingUpEntities, 5 seconds) {
-    transform{
+    transform {
       case Event(FullResult(b: Book), stateData: ResolvedDependencies) =>
         val lineItemForBook = stateData.inputs.request.lineItems.find(_.bookId == b.id)
         lineItemForBook match {
@@ -79,10 +85,10 @@ class SalesOrderProcessor extends FSM[SalesOrderProcessor.State, SalesOrderProce
       case Event(FullResult(u: BookstoreUser), stateData: ResolvedDependencies) =>
         stay using stateData.copy(user = Some(u))
 
-      case Event(EmptyResult, data:ResolvedDependencies) =>
+      case Event(EmptyResult, data: ResolvedDependencies) =>
         val (etype, error) =
           if (sender().path.name == BookMgrName) ("book", InvalidBookIdError)
-          else ("user", InvalidUserIdError )
+          else ("user", InvalidUserIdError)
         log.info("Unexpected result type of EmptyResult received looking up a {} entity", etype)
         data.originator ! Failure(FailureType.Validation, error)
         stop
@@ -93,7 +99,7 @@ class SalesOrderProcessor extends FSM[SalesOrderProcessor.State, SalesOrderProce
 
         log.info("Successfully looked up all entities and inventory is available, charging credit card")
         val lineItems = inputs.request.lineItems.
-          flatMap{item =>
+          flatMap { item =>
             bookMap.
               get(item.bookId).
               map(b => SalesOrderLineItem(0, 0, b.id, item.quantity, item.quantity * b.cost, new Date(), new Date()))
@@ -106,18 +112,50 @@ class SalesOrderProcessor extends FSM[SalesOrderProcessor.State, SalesOrderProce
   }
 
   when(ChargingCard, 5 seconds) {
-    transform{
-      case Event(FullResult(cct: CreditCardTransaction), stateData: LookedUpData) if cct.status == CreditTransactionStatus.Approved =>
-        stay using stateData
-      case _ =>
-        log.info("Failed to pay with credit card!")
-        stateData.originator ! Failure(FailureType.Validation, "Credit card payment failed")
-        stop
-    } using{
-      case FSM.State(state, LookedUpData(inputs, user, items, total), _, _, _) =>
-        goto(ChargingCard)
-    }
+
+    case Event(FullResult(cct: CreditCardTransaction), stateData: LookedUpData) if cct.status == CreditTransactionStatus.Approved =>
+      import akka.pattern.pipe
+      val salesOrder: SalesOrder = SalesOrder(0, stateData.user.id, cct.id, SalesOrderStatus.InProgress, stateData.total, stateData.items, new Date(), new Date())
+      dao.createSalesOrder(salesOrder) pipeTo self
+      goto(WritingEntity) using stateData
+    case Event(FullResult(cct: CreditCardTransaction), stateData: LookedUpData) =>
+      log.info("Failed to pay with credit card!")
+      stateData.originator ! Failure(FailureType.Validation, "Credit card payment failed")
+      stop
+
   }
+
+
+  when(WritingEntity, 5 seconds){
+    case Event(ord:SalesOrder, data:LookedUpData) =>
+      log.info("Successfully created new sales order: {}", ord)
+      data.originator ! FullResult(ord)
+      stop
+
+    case Event(Status.Failure(ex:InventoryNotAvailaleException), data:LookedUpData) =>
+      log.error(ex, "DB write failed because inventory for an item was not available when performing db writes")
+      data.originator ! Failure(FailureType.Validation, InventoryNotAvailError )
+      stop
+
+    case Event(Status.Failure(ex), data:LookedUpData) =>
+      log.error(ex, "Error creating a new sales order")
+      data.originator ! unexpectedFail
+      stop
+  }
+
+  whenUnhandled{
+    case e @ Event(StateTimeout, data) =>
+      log.error("State timeout when in state {}", stateName)
+      data.originator ! unexpectedFail
+      stop
+
+    case e @ Event(other, data) =>
+      log.error("Unexpected result of {} when in state {}", other, stateName)
+      data.originator ! unexpectedFail
+      stop
+  }
+
+
 
   def lookup(name: String) = context.actorSelection(s"/user/$name")
 }
@@ -127,6 +165,8 @@ object ResolutionIdent extends Enumeration {
 }
 
 object SalesOrderProcessor {
+
+  def props = Props[SalesOrderProcessor]
 
   sealed trait State
 
@@ -184,4 +224,57 @@ object SalesOrderProcessor {
   val CreditRejectedError = ErrorMessage("order.credit.rejected", Some("Your credit card has been rejected"))
   val InventoryNotAvailError = ErrorMessage("order.inventory.notavailable", Some("Inventory for an item on this order is no longer available"))
 
+
+}
+
+class SalesOrderProcessorDao(implicit ec: ExecutionContext) extends BookstoreDao {
+
+  import slick.driver.PostgresDriver.api._
+  import DaoHelpers._
+
+
+  def createSalesOrder(order: SalesOrder) = {
+    val insertHeader =
+      sqlu"""
+      insert into SalesOrderHeader (userId, creditTxnId, status, totalCost, createTs, modifyTs)
+      values (${order.userId}, ${order.creditTxnId}, ${order.status.toString}, ${order.totalCost}, ${order.createTs.toSqlDate}, ${order.modifyTs.toSqlDate})
+    """
+
+    val getId = lastIdSelect("salesorderheader")
+
+    def insertLineItems(orderId: Int) = order.lineItems.map { item =>
+      val insert =
+        sqlu"""
+          insert into SalesOrderLineItem (orderId, bookId, quantity, cost, createTs, modifyTs)
+          values ($orderId, ${item.bookId}, ${item.quantity}, ${item.cost}, ${item.createTs.toSqlDate}, ${item.modifyTs.toSqlDate})
+        """
+
+      //Using optimistic currency control on the update via the where clause
+      val decrementInv =
+        sqlu"""
+          update Book set inventoryAmount = inventoryAmount - ${item.quantity} where id = ${item.bookId} and inventoryAmount >= ${item.quantity}
+        """
+
+      insert.
+        andThen(decrementInv).
+        filter(_ == 1)
+    }
+
+
+    val txn =
+      for {
+        _ <- insertHeader
+        id <- getId
+        if id.headOption.isDefined
+        _ <- DBIOAction.sequence(insertLineItems(id.head))
+      } yield {
+        order.copy(id = id.head)
+      }
+
+    db.
+      run(txn.transactionally).
+      recoverWith {
+        case ex: NoSuchElementException => Future.failed(new InventoryNotAvailaleException)
+      }
+  }
 }

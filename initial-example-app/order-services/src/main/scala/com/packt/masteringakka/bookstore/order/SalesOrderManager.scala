@@ -59,11 +59,14 @@ class SalesOrderManager extends BookStoreActor{
       pipeResponse(result)      
     
     case req:CreateOrder =>
+//      log.info("Creating new sales order processor and forwarding request")
+//      val result = createOrder(req)
+//      pipeResponse(result.recover{
+//        case ex:OrderProcessingException => Failure(FailureType.Validation, ex.error)
+//      })
       log.info("Creating new sales order processor and forwarding request")
-      val result = createOrder(req)
-      pipeResponse(result.recover{
-        case ex:OrderProcessingException => Failure(FailureType.Validation, ex.error)
-      })
+      val proc = context.actorOf(SalesOrderProcessor.props)
+      proc forward req
   }
   /**
    * Does a lookup of orders using information from the books tied to the orders
