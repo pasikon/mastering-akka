@@ -26,6 +26,8 @@ class SalesOrderProcessor extends FSM[SalesOrderProcessor.State, SalesOrderProce
   implicit val ec: ExecutionContext = ExecutionContext.global
   val dao = new SalesOrderProcessorDao
 
+  def date = new Date()
+
   def unexpectedFail = Failure(FailureType.Service, ServiceResult.UnexpectedFailure)
 
   //  val dao = new SalesOrderPr
@@ -102,7 +104,7 @@ class SalesOrderProcessor extends FSM[SalesOrderProcessor.State, SalesOrderProce
           flatMap { item =>
             bookMap.
               get(item.bookId).
-              map(b => SalesOrderLineItem(0, 0, b.id, item.quantity, item.quantity * b.cost, new Date(), new Date()))
+              map(b => SalesOrderLineItem(0, 0, b.id, item.quantity, item.quantity * b.cost, date, date))
           }
 
         val total = lineItems.map(_.cost).sum
@@ -115,7 +117,7 @@ class SalesOrderProcessor extends FSM[SalesOrderProcessor.State, SalesOrderProce
 
     case Event(FullResult(cct: CreditCardTransaction), stateData: LookedUpData) if cct.status == CreditTransactionStatus.Approved =>
       import akka.pattern.pipe
-      val salesOrder: SalesOrder = SalesOrder(0, stateData.user.id, cct.id, SalesOrderStatus.InProgress, stateData.total, stateData.items, new Date(), new Date())
+      val salesOrder: SalesOrder = SalesOrder(0, stateData.user.id, cct.id, SalesOrderStatus.InProgress, stateData.total, stateData.items, date, date)
       dao.createSalesOrder(salesOrder) pipeTo self
       goto(WritingEntity) using stateData
     case Event(FullResult(cct: CreditCardTransaction), stateData: LookedUpData) =>

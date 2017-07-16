@@ -27,8 +27,8 @@ lazy val creditServices = (project in file("credit-services")).
   dependsOn(common)
 
 lazy val orderServices = (project in file("order-services")).
-  settings(commonSettings: _*).
-  dependsOn(common)
+  settings(commonSettings: _*)
+  .dependsOn(common % "compile->compile;test->test")
 
 //  packageArchetype.java_server
 lazy val server = {
